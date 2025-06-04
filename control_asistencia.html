@@ -1,0 +1,471 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs, serverTimestamp } from 'firebase/firestore';
+
+// Global variables provided by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+function App() {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [view, setView] = useState('register'); // 'register' or 'report'
+    const [message, setMessage] = useState('');
+
+    // Initialize Firebase and set up authentication listener
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+
+            // Listen for authentication state changes
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    // If no user, try to sign in with custom token or anonymously
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(firebaseAuth);
+                        }
+                    } catch (error) {
+                        console.error("Firebase authentication failed:", error);
+                        setMessage("Error de autenticación. Intenta recargar la página.");
+                    }
+                }
+                setIsAuthReady(true);
+            });
+
+            return () => unsubscribe(); // Cleanup the listener on component unmount
+        } catch (error) {
+            console.error("Failed to initialize Firebase:", error);
+            setMessage("Error al inicializar Firebase. Verifica la configuración.");
+        }
+    }, []);
+
+    // Function to show temporary messages
+    const showMessage = (msg) => {
+        setMessage(msg);
+        setTimeout(() => setMessage(''), 3000);
+    };
+
+    if (!isAuthReady) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-100">
+                <p className="text-lg text-gray-700">Cargando aplicación...</p>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4 font-inter">
+            <div className="max-w-4xl mx-auto bg-white shadow-xl rounded-xl p-6 md:p-8">
+                <h1 className="text-3xl md:text-4xl font-extrabold text-center text-indigo-800 mb-6">
+                    CBTis 143 Control de Asistencia
+                </h1>
+                {userId && (
+                    <p className="text-sm text-center text-gray-600 mb-4">
+                        ID de Usuario: <span className="font-mono text-blue-700 break-all">{userId}</span>
+                    </p>
+                )}
+                {message && (
+                    <div className="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded relative mb-4" role="alert">
+                        <span className="block sm:inline">{message}</span>
+                    </div>
+                )}
+
+                <div className="flex justify-center mb-6 space-x-4">
+                    <button
+                        onClick={() => setView('register')}
+                        className={`px-6 py-3 rounded-lg font-semibold transition-all duration-300 ease-in-out ${
+                            view === 'register'
+                                ? 'bg-indigo-600 text-white shadow-lg'
+                                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                        }`}
+                    >
+                        Registrar Alumno y QR
+                    </button>
+                    <button
+                        onClick={() => setView('report')}
+                        className={`px-6 py-3 rounded-lg font-semibold transition-all duration-300 ease-in-out ${
+                            view === 'report'
+                                ? 'bg-indigo-600 text-white shadow-lg'
+                                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                        }`}
+                    >
+                        Ver Reporte de Asistencia
+                    </button>
+                </div>
+
+                {view === 'register' && db && auth && userId && (
+                    <StudentRegistrationForm db={db} auth={auth} userId={userId} showMessage={showMessage} />
+                )}
+                {view === 'report' && db && auth && userId && (
+                    <AttendanceReport db={db} auth={auth} userId={userId} showMessage={showMessage} />
+                )}
+            </div>
+        </div>
+    );
+}
+
+function StudentRegistrationForm({ db, auth, userId, showMessage }) {
+    const [nombre, setNombre] = useState('');
+    const [grupo, setGrupo] = useState('');
+    const [semestre, setSemestre] = useState('1');
+    const [materia, setMateria] = useState('');
+    const [horaClase, setHoraClase] = useState('07:00');
+    const [numeroControl, setNumeroControl] = useState('');
+    const [qrCodeUrl, setQrCodeUrl] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    const handleRegisterStudent = async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        try {
+            // Check if student with this control number already exists
+            const studentsRef = collection(db, `artifacts/${appId}/users/${userId}/students`);
+            const q = query(studentsRef, where("numeroControl", "==", numeroControl));
+            const querySnapshot = await getDocs(q);
+
+            if (!querySnapshot.empty) {
+                showMessage("Error: Ya existe un alumno con este número de control.");
+                setLoading(false);
+                return;
+            }
+
+            // Add student data to Firestore
+            await addDoc(studentsRef, {
+                nombre,
+                grupo,
+                semestre: parseInt(semestre),
+                numeroControl,
+                createdAt: serverTimestamp()
+            });
+
+            // Data to encode in QR code: student's control number, subject, and class time
+            const qrData = JSON.stringify({
+                control: numeroControl,
+                materia: materia,
+                hora: horaClase
+            });
+            const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrData)}`;
+            setQrCodeUrl(qrApiUrl);
+
+            showMessage("Alumno registrado y código QR generado exitosamente.");
+            // Clear form fields after successful registration
+            setNombre('');
+            setGrupo('');
+            setSemestre('1');
+            setMateria('');
+            setHoraClase('07:00');
+            setNumeroControl('');
+
+        } catch (error) {
+            console.error("Error al registrar alumno o generar QR:", error);
+            showMessage("Error al registrar alumno o generar QR. Intenta de nuevo.");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    // Function to simulate QR scan for attendance
+    const handleSimulateScan = async () => {
+        if (!qrCodeUrl) {
+            showMessage("Primero genera un código QR para simular el escaneo.");
+            return;
+        }
+        setLoading(true);
+        try {
+            // Extract data from the current QR code URL
+            const urlParams = new URLSearchParams(qrCodeUrl.split('?')[1]);
+            const qrDataString = urlParams.get('data');
+            const qrData = JSON.parse(qrDataString);
+
+            const { control, materia, hora } = qrData;
+
+            // Record attendance in Firestore
+            const attendanceRef = collection(db, `artifacts/${appId}/users/${userId}/attendance`);
+            await addDoc(attendanceRef, {
+                numeroControl: control,
+                materia: materia,
+                horaClase: hora,
+                timestamp: serverTimestamp()
+            });
+            showMessage(`Asistencia registrada para el alumno ${control} en ${materia} a las ${hora}.`);
+        } catch (error) {
+            console.error("Error al simular escaneo y registrar asistencia:", error);
+            showMessage("Error al simular escaneo y registrar asistencia. Intenta de nuevo.");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="bg-white p-6 rounded-lg shadow-md">
+            <h2 className="text-2xl font-bold text-indigo-700 mb-5 text-center">Registrar Alumno y Generar QR</h2>
+            <form onSubmit={handleRegisterStudent} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label htmlFor="nombre" className="block text-gray-700 text-sm font-bold mb-2">Nombre del Alumno:</label>
+                    <input
+                        type="text"
+                        id="nombre"
+                        value={nombre}
+                        onChange={(e) => setNombre(e.target.value)}
+                        className="shadow appearance-none border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        required
+                    />
+                </div>
+                <div>
+                    <label htmlFor="grupo" className="block text-gray-700 text-sm font-bold mb-2">Grupo:</label>
+                    <input
+                        type="text"
+                        id="grupo"
+                        value={grupo}
+                        onChange={(e) => setGrupo(e.target.value)}
+                        className="shadow appearance-none border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        required
+                    />
+                </div>
+                <div>
+                    <label htmlFor="semestre" className="block text-gray-700 text-sm font-bold mb-2">Semestre:</label>
+                    <select
+                        id="semestre"
+                        value={semestre}
+                        onChange={(e) => setSemestre(e.target.value)}
+                        className="shadow border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        required
+                    >
+                        {[...Array(6)].map((_, i) => (
+                            <option key={i + 1} value={i + 1}>{i + 1}°</option>
+                        ))}
+                    </select>
+                </div>
+                <div>
+                    <label htmlFor="materia" className="block text-gray-700 text-sm font-bold mb-2">Materia:</label>
+                    <input
+                        type="text"
+                        id="materia"
+                        value={materia}
+                        onChange={(e) => setMateria(e.target.value)}
+                        className="shadow appearance-none border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        required
+                    />
+                </div>
+                <div>
+                    <label htmlFor="horaClase" className="block text-gray-700 text-sm font-bold mb-2">Hora de Clase:</label>
+                    <select
+                        id="horaClase"
+                        value={horaClase}
+                        onChange={(e) => setHoraClase(e.target.value)}
+                        className="shadow border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        required
+                    >
+                        {[...Array(9)].map((_, i) => {
+                            const hour = 7 + i;
+                            const time = `${hour < 10 ? '0' : ''}${hour}:00`;
+                            return <option key={time} value={time}>{time}</option>;
+                        })}
+                    </select>
+                </div>
+                <div>
+                    <label htmlFor="numeroControl" className="block text-gray-700 text-sm font-bold mb-2">Número de Control:</label>
+                    <input
+                        type="text"
+                        id="numeroControl"
+                        value={numeroControl}
+                        onChange={(e) => setNumeroControl(e.target.value)}
+                        className="shadow appearance-none border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        required
+                    />
+                </div>
+                <div className="md:col-span-2 flex justify-center mt-4">
+                    <button
+                        type="submit"
+                        className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition-all duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
+                        disabled={loading}
+                    >
+                        {loading ? 'Generando...' : 'Registrar Alumno y Generar QR'}
+                    </button>
+                </div>
+            </form>
+
+            {qrCodeUrl && (
+                <div className="mt-8 p-6 bg-gray-50 rounded-lg shadow-inner text-center">
+                    <h3 className="text-xl font-bold text-gray-800 mb-4">Código QR para Asistencia</h3>
+                    <img src={qrCodeUrl} alt="Código QR" className="mx-auto border-4 border-indigo-300 rounded-lg" />
+                    <p className="text-gray-600 mt-3">Escanea este código para registrar la asistencia.</p>
+                    <button
+                        onClick={handleSimulateScan}
+                        className="mt-5 bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-5 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2"
+                        disabled={loading}
+                    >
+                        {loading ? 'Escaneando...' : 'Simular Escaneo QR (Check-in)'}
+                    </button>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function AttendanceReport({ db, auth, userId, showMessage }) {
+    const [selectedMateria, setSelectedMateria] = useState('');
+    const [selectedHoraClase, setSelectedHoraClase] = useState('07:00');
+    const [attendanceList, setAttendanceList] = useState([]);
+    const [allStudents, setAllStudents] = useState([]);
+    const [loading, setLoading] = useState(false);
+
+    // Fetch all students to map control numbers to names
+    useEffect(() => {
+        if (!db || !userId) return;
+
+        const studentsRef = collection(db, `artifacts/${appId}/users/${userId}/students`);
+        const unsubscribe = onSnapshot(studentsRef, (snapshot) => {
+            const studentsData = {};
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                studentsData[data.numeroControl] = data.nombre;
+            });
+            setAllStudents(studentsData);
+        }, (error) => {
+            console.error("Error fetching students:", error);
+            showMessage("Error al cargar la lista de alumnos.");
+        });
+
+        return () => unsubscribe();
+    }, [db, userId, showMessage]);
+
+    const fetchAttendanceReport = useCallback(async () => {
+        if (!db || !userId || !selectedMateria || !selectedHoraClase) {
+            setAttendanceList([]); // Clear previous results if criteria are not met
+            return;
+        }
+
+        setLoading(true);
+        try {
+            const attendanceRef = collection(db, `artifacts/${appId}/users/${userId}/attendance`);
+            const q = query(
+                attendanceRef,
+                where("materia", "==", selectedMateria),
+                where("horaClase", "==", selectedHoraClase)
+            );
+
+            const querySnapshot = await getDocs(q);
+            const records = [];
+            querySnapshot.forEach(doc => {
+                const data = doc.data();
+                records.push({ id: doc.id, ...data });
+            });
+
+            // Sort attendance records by timestamp (oldest first)
+            records.sort((a, b) => (a.timestamp?.toDate() || 0) - (b.timestamp?.toDate() || 0));
+
+            // Filter unique attendees (first check-in for the class)
+            const uniqueAttendees = {};
+            records.forEach(record => {
+                if (!uniqueAttendees[record.numeroControl]) {
+                    uniqueAttendees[record.numeroControl] = {
+                        numeroControl: record.numeroControl,
+                        nombre: allStudents[record.numeroControl] || 'Desconocido',
+                        checkinTime: record.timestamp ? record.timestamp.toDate().toLocaleTimeString() : 'N/A'
+                    };
+                }
+            });
+
+            setAttendanceList(Object.values(uniqueAttendees));
+            showMessage(`Reporte generado para ${selectedMateria} a las ${selectedHoraClase}.`);
+        } catch (error) {
+            console.error("Error fetching attendance report:", error);
+            showMessage("Error al cargar el reporte de asistencia. Intenta de nuevo.");
+        } finally {
+            setLoading(false);
+        }
+    }, [db, userId, selectedMateria, selectedHoraClase, allStudents, showMessage]);
+
+    // Fetch report whenever selectedMateria or selectedHoraClase changes
+    useEffect(() => {
+        fetchAttendanceReport();
+    }, [fetchAttendanceReport]);
+
+    return (
+        <div className="bg-white p-6 rounded-lg shadow-md">
+            <h2 className="text-2xl font-bold text-indigo-700 mb-5 text-center">Reporte de Asistencia</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                <div>
+                    <label htmlFor="reportMateria" className="block text-gray-700 text-sm font-bold mb-2">Materia:</label>
+                    <input
+                        type="text"
+                        id="reportMateria"
+                        value={selectedMateria}
+                        onChange={(e) => setSelectedMateria(e.target.value)}
+                        className="shadow appearance-none border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        placeholder="Ej. Matemáticas"
+                    />
+                </div>
+                <div>
+                    <label htmlFor="reportHoraClase" className="block text-gray-700 text-sm font-bold mb-2">Hora de Clase:</label>
+                    <select
+                        id="reportHoraClase"
+                        value={selectedHoraClase}
+                        onChange={(e) => setSelectedHoraClase(e.target.value)}
+                        className="shadow border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    >
+                        {[...Array(9)].map((_, i) => {
+                            const hour = 7 + i;
+                            const time = `${hour < 10 ? '0' : ''}${hour}:00`;
+                            return <option key={time} value={time}>{time}</option>;
+                        })}
+                    </select>
+                </div>
+            </div>
+
+            <div className="mb-4 text-center">
+                <button
+                    onClick={fetchAttendanceReport}
+                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-5 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+                    disabled={loading}
+                >
+                    {loading ? 'Cargando...' : 'Generar Reporte'}
+                </button>
+            </div>
+
+            {attendanceList.length > 0 ? (
+                <div className="overflow-x-auto">
+                    <table className="min-w-full bg-white border border-gray-200 rounded-lg shadow-sm">
+                        <thead className="bg-gray-100">
+                            <tr>
+                                <th className="py-3 px-4 text-left text-sm font-semibold text-gray-700 border-b">Nombre del Alumno</th>
+                                <th className="py-3 px-4 text-left text-sm font-semibold text-gray-700 border-b">Número de Control</th>
+                                <th className="py-3 px-4 text-left text-sm font-semibold text-gray-700 border-b">Hora de Check-in</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {attendanceList.map((record, index) => (
+                                <tr key={index} className="border-b border-gray-100 hover:bg-gray-50">
+                                    <td className="py-3 px-4 text-sm text-gray-800">{record.nombre}</td>
+                                    <td className="py-3 px-4 text-sm text-gray-800">{record.numeroControl}</td>
+                                    <td className="py-3 px-4 text-sm text-gray-800">{record.checkinTime}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            ) : (
+                <p className="text-center text-gray-600 mt-8">
+                    {loading ? 'Cargando datos...' : 'No hay asistencias registradas para esta materia y hora, o los criterios de búsqueda no son válidos.'}
+                </p>
+            )}
+        </div>
+    );
+}
+
+export default App;
